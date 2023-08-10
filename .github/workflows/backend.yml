@@ -66,7 +66,7 @@ jobs:
     needs: files-changed
     name: backend test
     runs-on: ubuntu-20.04
-    timeout-minutes: 40
+    timeout-minutes: 80
     strategy:
       # This helps not having to run multiple jobs because one fails, thus, reducing resource usage
       # and reducing the risk that one of many runs would turn red again (read: intermittent tests)
@@ -87,6 +87,10 @@ jobs:
           # Avoid codecov error message related to SHA resolution:
           # https://github.com/codecov/codecov-bash/blob/7100762afbc822b91806a6574658129fe0d23a7d/codecov#L891
           fetch-depth: '2'
+
+      - name: Update environment for silo tests
+        run: |
+          echo "SENTRY_FORCE_SILOED_TESTS=1" >> "$GITHUB_ENV"
 
       - name: Setup sentry env
         uses: ./.github/actions/setup-sentry
@@ -130,6 +134,10 @@ jobs:
           # https://github.com/codecov/codecov-bash/blob/7100762afbc822b91806a6574658129fe0d23a7d/codecov#L891
           fetch-depth: '2'
 
+      - name: Update environment for silo tests
+        run: |
+          echo "SENTRY_FORCE_SILOED_TESTS=1" >> "$GITHUB_ENV"
+
       - name: Setup sentry env
         uses: ./.github/actions/setup-sentry
         id: setup
@@ -160,6 +168,10 @@ jobs:
         pg-version: ['14']
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # v3.1.0
+
+      - name: Update environment for silo tests
+        run: |
+          echo "SENTRY_FORCE_SILOED_TESTS=1" >> "$GITHUB_ENV"
 
       - name: Setup sentry env
         uses: ./.github/actions/setup-sentry
