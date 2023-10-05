@@ -12,6 +12,7 @@ from sentry.integrations.base import IntegrationInstallation
 from sentry.integrations.utils.commit_context import (
     find_commit_context_for_event,
     find_commit_context_for_event_all_frames,
+    get_or_create_commit_from_blame,
 )
 from sentry.locks import locks
 from sentry.models.commit import Commit
@@ -214,9 +215,6 @@ def process_commit_context(
             frame = next(filter(lambda frame: frame.get("in_app", False), frames[::-1]), None)
 
             if not frame:
-                # When we could not find the in_app frame for the event, we will debounce the task for 1 day.
-                # New events can be unrelated to the original event and may have an "in_app" frame.
-                cache.set(cache_key, True, timedelta(days=1).total_seconds())
                 metrics.incr(
                     "sentry.tasks.process_commit_context.aborted",
                     tags={
@@ -231,133 +229,150 @@ def process_commit_context(
                         "fallback": True,
                     },
                 )
-                process_suspect_commits.delay(
-                    event_id=event_id,
-                    event_platform=event_platform,
-                    event_frames=event_frames,
-                    group_id=group_id,
-                    project_id=project_id,
-                    sdk_name=sdk_name,
-                )
+
+                # New suspect commit logic will NOT retry
+                if not features.has(
+                    "organizations:suspect-commits-all-frames", project.organization
+                ):
+                    # When we could not find the in_app frame for the event, we will debounce the task for 1 day.
+                    # New events can be unrelated to the original event and may have an "in_app" frame.
+                    cache.set(cache_key, True, timedelta(days=1).total_seconds())
+                    process_suspect_commits.delay(
+                        event_id=event_id,
+                        event_platform=event_platform,
+                        event_frames=event_frames,
+                        group_id=group_id,
+                        project_id=project_id,
+                        sdk_name=sdk_name,
+                    )
                 return
 
             if features.has("organizations:suspect-commits-all-frames", project.organization):
-                find_commit_context_for_event_all_frames(
+                blame, installation = find_commit_context_for_event_all_frames(
                     code_mappings=code_mappings,
                     frames=frames,
                     organization_id=project.organization_id,
                     project_id=project_id,
-                    extra={},
+                    extra=basic_logging_details,
                 )
 
-            found_contexts, installation = find_commit_context_for_event(
-                code_mappings=code_mappings,
-                frame=frame,
-                extra={
-                    **basic_logging_details,
-                },
-            )
+                if not blame or not installation:
+                    return
 
-            if not len(found_contexts):
-                # Couldn't find the blame with any of the code mappings, so we will debounce the task for PREFERRED_GROUP_OWNER_AGE.
-                # We will clear the debounce cache when the org adds new code mappings for the project of this group.
-                cache.set(cache_key, True, PREFERRED_GROUP_OWNER_AGE.total_seconds())
+                selected_code_mapping = blame.code_mapping
 
-                metrics.incr(
-                    "sentry.tasks.process_commit_context.aborted",
-                    tags={
-                        "detail": "could_not_fetch_commit_context",
-                    },
+                commit = get_or_create_commit_from_blame(
+                    blame, organization_id=project.organization_id, extra=basic_logging_details
                 )
-                logger.info(
-                    "process_commit_context.find_commit_context",
+            else:
+                found_contexts, installation = find_commit_context_for_event(
+                    code_mappings=code_mappings,
+                    frame=frame,
                     extra={
                         **basic_logging_details,
-                        "reason": "could_not_fetch_commit_context",
-                        "code_mappings_count": len(code_mappings),
-                        "fallback": True,
                     },
                 )
-                process_suspect_commits.delay(
-                    event_id=event_id,
-                    event_platform=event_platform,
-                    event_frames=event_frames,
-                    group_id=group_id,
-                    project_id=project_id,
-                    sdk_name=sdk_name,
-                )
-                return
 
-            commit = None
-            new_commit = None
-            selected_code_mapping = None
-            for commit_context, code_mapping in found_contexts:
-                try:
-                    # Find commit and break
-                    commit = Commit.objects.get(
-                        repository_id=code_mapping.repository_id,
-                        key=commit_context.get("commitId"),
-                    )
-                    if commit.message == "":
-                        commit.message = commit_context.get("commitMessage")
-                        commit.save()
-                    selected_code_mapping = code_mapping
-                    break
-                except Commit.DoesNotExist:
-                    # If the commit has no date, we will not add it to avoid breaking other commit ordered-based logic.
-                    if not new_commit and commit_context.get("committedDate"):
-                        new_commit = {
-                            "context": commit_context,
-                            "repository_id": code_mapping.repository_id,
-                            "code_mapping_id": code_mapping.id,
-                        }
+                if not len(found_contexts):
+                    # Couldn't find the blame with any of the code mappings, so we will debounce the task for PREFERRED_GROUP_OWNER_AGE.
+                    # We will clear the debounce cache when the org adds new code mappings for the project of this group.
+                    cache.set(cache_key, True, PREFERRED_GROUP_OWNER_AGE.total_seconds())
 
-                    logger.info(
-                        "process_commit_context.no_commit_in_sentry",
-                        extra={
-                            **basic_logging_details,
-                            "sha": commit_context.get("commitId"),
-                            "repository_id": code_mapping.repository_id,
-                            "code_mapping_id": code_mapping.id,
-                            "reason": "commit_sha_does_not_exist_in_sentry",
-                        },
-                    )
-
-            if not commit:
-                if new_commit:
-                    context = new_commit["context"]
-                    # If none of the commits exist in sentry_commit, we add the first commit we found
-                    commit_author, _ = CommitAuthor.objects.get_or_create(
-                        organization_id=project.organization_id,
-                        email=context.get("commitAuthorEmail"),
-                        defaults={"name": context.get("commitAuthorName")},
-                    )
-                    commit = Commit.objects.create(
-                        organization_id=project.organization_id,
-                        repository_id=new_commit["repository_id"],
-                        key=context.get("commitId"),
-                        date_added=context.get("committedDate"),
-                        author=commit_author,
-                        message=context.get("commitMessage"),
-                    )
-
-                    logger.info(
-                        "process_commit_context.added_commit_to_sentry_commit",
-                        extra={
-                            **basic_logging_details,
-                            "sha": new_commit.get("commitId"),
-                            "repository_id": new_commit["repository_id"],
-                            "code_mapping_id": new_commit["code_mapping_id"],
-                            "reason": "commit_sha_does_not_exist_in_sentry_for_all_code_mappings",
-                        },
-                    )
-                else:
                     metrics.incr(
                         "sentry.tasks.process_commit_context.aborted",
                         tags={
-                            "detail": "commit_sha_does_not_exist_in_sentry",
+                            "detail": "could_not_fetch_commit_context",
                         },
                     )
+                    logger.info(
+                        "process_commit_context.find_commit_context",
+                        extra={
+                            **basic_logging_details,
+                            "reason": "could_not_fetch_commit_context",
+                            "code_mappings_count": len(code_mappings),
+                            "fallback": True,
+                        },
+                    )
+                    process_suspect_commits.delay(
+                        event_id=event_id,
+                        event_platform=event_platform,
+                        event_frames=event_frames,
+                        group_id=group_id,
+                        project_id=project_id,
+                        sdk_name=sdk_name,
+                    )
+                    return
+
+                commit = None
+                new_commit = None
+                selected_code_mapping = None
+                for commit_context, code_mapping in found_contexts:
+                    try:
+                        # Find commit and break
+                        commit = Commit.objects.get(
+                            repository_id=code_mapping.repository_id,
+                            key=commit_context.get("commitId"),
+                        )
+                        if commit.message == "":
+                            commit.message = commit_context.get("commitMessage")
+                            commit.save()
+                        selected_code_mapping = code_mapping
+                        break
+                    except Commit.DoesNotExist:
+                        # If the commit has no date, we will not add it to avoid breaking other commit ordered-based logic.
+                        if not new_commit and commit_context.get("committedDate"):
+                            new_commit = {
+                                "context": commit_context,
+                                "repository_id": code_mapping.repository_id,
+                                "code_mapping_id": code_mapping.id,
+                            }
+
+                        logger.info(
+                            "process_commit_context.no_commit_in_sentry",
+                            extra={
+                                **basic_logging_details,
+                                "sha": commit_context.get("commitId"),
+                                "repository_id": code_mapping.repository_id,
+                                "code_mapping_id": code_mapping.id,
+                                "reason": "commit_sha_does_not_exist_in_sentry",
+                            },
+                        )
+
+                if not commit:
+                    if new_commit:
+                        context = new_commit["context"]
+                        # If none of the commits exist in sentry_commit, we add the first commit we found
+                        commit_author, _ = CommitAuthor.objects.get_or_create(
+                            organization_id=project.organization_id,
+                            email=context.get("commitAuthorEmail"),
+                            defaults={"name": context.get("commitAuthorName")},
+                        )
+                        commit = Commit.objects.create(
+                            organization_id=project.organization_id,
+                            repository_id=new_commit["repository_id"],
+                            key=context.get("commitId"),
+                            date_added=context.get("committedDate"),
+                            author=commit_author,
+                            message=context.get("commitMessage"),
+                        )
+
+                        logger.info(
+                            "process_commit_context.added_commit_to_sentry_commit",
+                            extra={
+                                **basic_logging_details,
+                                "sha": new_commit.get("commitId"),
+                                "repository_id": new_commit["repository_id"],
+                                "code_mapping_id": new_commit["code_mapping_id"],
+                                "reason": "commit_sha_does_not_exist_in_sentry_for_all_code_mappings",
+                            },
+                        )
+                    else:
+                        metrics.incr(
+                            "sentry.tasks.process_commit_context.aborted",
+                            tags={
+                                "detail": "commit_sha_does_not_exist_in_sentry",
+                            },
+                        )
 
             authors = list(CommitAuthor.objects.get_many_from_cache([commit.author_id]))
             author_to_user = get_users_for_authors(commit.organization_id, authors)
