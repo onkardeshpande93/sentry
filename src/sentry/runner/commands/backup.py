@@ -5,12 +5,6 @@ import click
 from sentry.backup.comparators import get_default_comparators
 from sentry.backup.findings import FindingJSONEncoder
 from sentry.backup.helpers import ImportFlags
-from sentry.backup.imports import (
-    import_in_config_scope,
-    import_in_global_scope,
-    import_in_organization_scope,
-    import_in_user_scope,
-)
 from sentry.backup.validate import validate
 from sentry.runner.decorators import configuration
 from sentry.utils import json
@@ -115,6 +109,8 @@ def import_users(src, filter_usernames, merge_users, silent):
     Import the Sentry users from an exported JSON file.
     """
 
+    from sentry.backup.imports import import_in_user_scope
+
     import_in_user_scope(
         src,
         flags=ImportFlags(merge_users=merge_users),
@@ -146,6 +142,8 @@ def import_organizations(src, filter_org_slugs, merge_users, silent):
     Import the Sentry organizations, and all constituent Sentry users, from an exported JSON file.
     """
 
+    from sentry.backup.imports import import_in_organization_scope
+
     import_in_organization_scope(
         src,
         flags=ImportFlags(merge_users=merge_users),
@@ -175,6 +173,8 @@ def import_config(src, merge_users, overwrite_configs, silent):
     Import all configuration and administrator accounts needed to set up this Sentry instance.
     """
 
+    from sentry.backup.imports import import_in_config_scope
+
     import_in_config_scope(
         src,
         flags=ImportFlags(merge_users=merge_users, overwrite_configs=overwrite_configs),
@@ -196,6 +196,8 @@ def import_global(src, silent, overwrite_configs):
     """
     Import all Sentry data from an exported JSON file.
     """
+
+    from sentry.backup.imports import import_in_global_scope
 
     import_in_global_scope(
         src,
