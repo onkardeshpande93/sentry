@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from typing import Callable, Sequence, TextIO
+
 import click
 
 from sentry.backup.comparators import get_default_comparators
-from sentry.backup.findings import FindingJSONEncoder
+from sentry.backup.findings import Finding, FindingJSONEncoder
 from sentry.backup.helpers import ImportFlags
 from sentry.backup.validate import validate
 from sentry.runner.decorators import configuration
 from sentry.utils import json
+
+DEFAULT_INDENT = 2
 
 MERGE_USERS_HELP = """If this flag is set and users in the import JSON have matching usernames to
                    those already in the database, the existing users are used instead and their
@@ -21,8 +25,15 @@ OVERWRITE_CONFIGS_HELP = """Imports are generally non-destructive of old data. H
                          the flag is left in its (default) unset state, the old value will be
                          retained in the event of a collision."""
 
-FINDINGS_FILE_HELP = """Optional file that records comparator findings, saved in the JSON format.
+FINDINGS_FILE_HELP = """Optional file that records error findings, saved in the JSON format.
                      If left unset, no such file is written."""
+
+
+def get_printer(silent: bool) -> Callable:
+    if silent:
+        return lambda *args, **kwargs: None
+    else:
+        return click.echo
 
 
 def parse_filter_arg(filter_arg: str) -> set[str] | None:
@@ -33,14 +44,25 @@ def parse_filter_arg(filter_arg: str) -> set[str] | None:
     return filter_by
 
 
-findings_encoder = FindingJSONEncoder(
-    sort_keys=True,
-    ensure_ascii=True,
-    check_circular=True,
-    allow_nan=True,
-    indent=2,
-    encoding="utf-8",
-)
+def write_findings(
+    findings_file: TextIO | None, findings: Sequence[Finding], indent: int, printer: Callable
+):
+    for f in findings:
+        printer(f.pretty(), err=True)
+
+    if findings_file:
+        findings_encoder = FindingJSONEncoder(
+            sort_keys=True,
+            ensure_ascii=True,
+            check_circular=True,
+            allow_nan=True,
+            indent=indent,
+            encoding="utf-8",
+        )
+
+        with findings_file as file:
+            encoded = findings_encoder.encode(findings)
+            file.write(encoded)
 
 
 @click.command(name="compare")
@@ -72,11 +94,7 @@ def compare(left, right, findings_file):
 
     res = validate(left_data, right_data, get_default_comparators())
     if res:
-        if findings_file:
-            with findings_file as f:
-                encoded = findings_encoder.encode(res.findings)
-                f.write(encoded)
-
+        write_findings(findings_file, res.findings, DEFAULT_INDENT, click.echo)  # type: ignore
         click.echo(f"Done, found {len(res.findings)} differences:\n\n{res.pretty()}")
     else:
         click.echo("Done, found 0 differences!")
@@ -97,6 +115,12 @@ def import_():
     "If this option is not set, all encountered users are imported.",
 )
 @click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
+@click.option(
     "--merge_users",
     default=False,
     is_flag=True,
@@ -104,19 +128,25 @@ def import_():
 )
 @click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def import_users(src, filter_usernames, merge_users, silent):
+def import_users(src, filter_usernames, findings_file, merge_users, silent):
     """
     Import the Sentry users from an exported JSON file.
     """
 
-    from sentry.backup.imports import import_in_user_scope
+    from sentry.backup.imports import ImportingError, import_in_user_scope
 
-    import_in_user_scope(
-        src,
-        flags=ImportFlags(merge_users=merge_users),
-        user_filter=parse_filter_arg(filter_usernames),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        import_in_user_scope(
+            src,
+            flags=ImportFlags(merge_users=merge_users),
+            user_filter=parse_filter_arg(filter_usernames),
+            printer=printer,
+        )
+    except ImportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @import_.command(name="organizations")
@@ -130,6 +160,12 @@ def import_users(src, filter_usernames, merge_users, silent):
     "Users not members of at least one organization in this set will not be imported.",
 )
 @click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
+@click.option(
     "--merge_users",
     default=False,
     is_flag=True,
@@ -137,24 +173,35 @@ def import_users(src, filter_usernames, merge_users, silent):
 )
 @click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def import_organizations(src, filter_org_slugs, merge_users, silent):
+def import_organizations(src, filter_org_slugs, findings_file, merge_users, silent):
     """
     Import the Sentry organizations, and all constituent Sentry users, from an exported JSON file.
     """
 
-    from sentry.backup.imports import import_in_organization_scope
+    from sentry.backup.imports import ImportingError, import_in_organization_scope
 
-    import_in_organization_scope(
-        src,
-        flags=ImportFlags(merge_users=merge_users),
-        org_filter=parse_filter_arg(filter_org_slugs),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        import_in_organization_scope(
+            src,
+            flags=ImportFlags(merge_users=merge_users),
+            org_filter=parse_filter_arg(filter_org_slugs),
+            printer=printer,
+        )
+    except ImportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @import_.command(name="config")
 @click.argument("src", type=click.File("rb"))
-@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
+@click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
 @click.option(
     "--merge_users",
     default=False,
@@ -167,24 +214,37 @@ def import_organizations(src, filter_org_slugs, merge_users, silent):
     is_flag=True,
     help=OVERWRITE_CONFIGS_HELP,
 )
+@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def import_config(src, merge_users, overwrite_configs, silent):
+def import_config(src, findings_file, merge_users, overwrite_configs, silent):
     """
     Import all configuration and administrator accounts needed to set up this Sentry instance.
     """
 
-    from sentry.backup.imports import import_in_config_scope
+    from sentry.backup.imports import ImportingError, import_in_config_scope
 
-    import_in_config_scope(
-        src,
-        flags=ImportFlags(merge_users=merge_users, overwrite_configs=overwrite_configs),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        import_in_config_scope(
+            src,
+            flags=ImportFlags(merge_users=merge_users, overwrite_configs=overwrite_configs),
+            printer=printer,
+        )
+    except ImportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @import_.command(name="global")
 @click.argument("src", type=click.File("rb"))
 @click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
+@click.option(
     "--overwrite_configs",
     default=False,
     is_flag=True,
@@ -192,18 +252,24 @@ def import_config(src, merge_users, overwrite_configs, silent):
 )
 @click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def import_global(src, silent, overwrite_configs):
+def import_global(src, findings_file, overwrite_configs, silent):
     """
     Import all Sentry data from an exported JSON file.
     """
 
-    from sentry.backup.imports import import_in_global_scope
+    from sentry.backup.imports import ImportingError, import_in_global_scope
 
-    import_in_global_scope(
-        src,
-        flags=ImportFlags(overwrite_configs=overwrite_configs),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        import_in_global_scope(
+            src,
+            flags=ImportFlags(overwrite_configs=overwrite_configs),
+            printer=printer,
+        )
+    except ImportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @click.group(name="export")
@@ -213,13 +279,6 @@ def export():
 
 @export.command(name="users")
 @click.argument("dest", default="-", type=click.File("w"))
-@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
-@click.option(
-    "--indent",
-    default=2,
-    type=int,
-    help="Number of spaces to indent for the JSON output. (default: 2)",
-)
 @click.option(
     "--filter_usernames",
     default="",
@@ -227,31 +286,43 @@ def export():
     help="An optional comma-separated list of users to include. "
     "If this option is not set, all encountered users are imported.",
 )
-@configuration
-def export_users(dest, silent, indent, filter_usernames):
-    """
-    Export all Sentry users in the JSON format.
-    """
-
-    from sentry.backup.exports import export_in_user_scope
-
-    export_in_user_scope(
-        dest,
-        indent=indent,
-        user_filter=parse_filter_arg(filter_usernames),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
-
-
-@export.command(name="organizations")
-@click.argument("dest", default="-", type=click.File("w"))
-@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
+@click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
 @click.option(
     "--indent",
     default=2,
     type=int,
     help="Number of spaces to indent for the JSON output. (default: 2)",
 )
+@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
+@configuration
+def export_users(dest, filter_usernames, findings_file, indent, silent):
+    """
+    Export all Sentry users in the JSON format.
+    """
+
+    from sentry.backup.exports import ExportingError, export_in_user_scope
+
+    printer = get_printer(silent)
+    try:
+        export_in_user_scope(
+            dest,
+            indent=indent,
+            user_filter=parse_filter_arg(filter_usernames),
+            printer=printer,
+        )
+    except ExportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
+
+
+@export.command(name="organizations")
+@click.argument("dest", default="-", type=click.File("w"))
 @click.option(
     "--filter_org_slugs",
     default="",
@@ -260,65 +331,108 @@ def export_users(dest, silent, indent, filter_usernames):
     "If this option is not set, all encountered organizations are exported. "
     "Users not members of at least one organization in this set will not be exported.",
 )
+@click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
+@click.option(
+    "--indent",
+    default=2,
+    type=int,
+    help="Number of spaces to indent for the JSON output. (default: 2)",
+)
+@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def export_organizations(dest, silent, indent, filter_org_slugs):
+def export_organizations(dest, filter_org_slugs, findings_file, indent, silent):
     """
     Export all Sentry organizations, and their constituent users, in the JSON format.
     """
 
-    from sentry.backup.exports import export_in_organization_scope
+    from sentry.backup.exports import ExportingError, export_in_organization_scope
 
-    export_in_organization_scope(
-        dest,
-        indent=indent,
-        org_filter=parse_filter_arg(filter_org_slugs),
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        export_in_organization_scope(
+            dest,
+            indent=indent,
+            org_filter=parse_filter_arg(filter_org_slugs),
+            printer=printer,
+        )
+    except ExportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @export.command(name="config")
 @click.argument("dest", default="-", type=click.File("w"))
-@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
+@click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
 @click.option(
     "--indent",
     default=2,
     type=int,
     help="Number of spaces to indent for the JSON output. (default: 2)",
 )
+@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def export_config(dest, silent, indent):
+def export_config(dest, findings_file, indent, silent):
     """
     Export all configuration and administrator accounts needed to set up this Sentry instance.
     """
 
-    from sentry.backup.exports import export_in_config_scope
+    from sentry.backup.exports import ExportingError, export_in_config_scope
 
-    export_in_config_scope(
-        dest,
-        indent=indent,
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        export_in_config_scope(
+            dest,
+            indent=indent,
+            printer=printer,
+        )
+    except ExportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
 
 
 @export.command(name="global")
 @click.argument("dest", default="-", type=click.File("w"))
-@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
+@click.option(
+    "--findings_file",
+    type=click.File("w"),
+    required=False,
+    help=FINDINGS_FILE_HELP,
+)
 @click.option(
     "--indent",
     default=2,
     type=int,
     help="Number of spaces to indent for the JSON output. (default: 2)",
 )
+@click.option("--silent", "-q", default=False, is_flag=True, help="Silence all debug output.")
 @configuration
-def export_global(dest, silent, indent):
+def export_global(dest, findings_file, indent, silent):
     """
     Export all Sentry data in the JSON format.
     """
 
-    from sentry.backup.exports import export_in_global_scope
+    from sentry.backup.exports import ExportingError, export_in_global_scope
 
-    export_in_global_scope(
-        dest,
-        indent=indent,
-        printer=(lambda *args, **kwargs: None) if silent else click.echo,
-    )
+    printer = get_printer(silent)
+    try:
+        export_in_global_scope(
+            dest,
+            indent=indent,
+            printer=printer,
+        )
+    except ExportingError as e:
+        if e.context:
+            write_findings(findings_file, [e.context], 2, printer)
+        raise e
