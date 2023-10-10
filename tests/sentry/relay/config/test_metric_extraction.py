@@ -390,7 +390,8 @@ def test_get_metric_extraction_config_with_failure_count(default_project):
 @django_db_all
 def test_get_metric_extraction_config_with_apdex(default_project):
     with Feature({ON_DEMAND_METRICS: True, ON_DEMAND_METRICS_WIDGETS: True}):
-        create_alert("apdex(10)", "transaction.duration:>=1000", default_project)
+        threshold = 10
+        create_alert(f"apdex({threshold})", "transaction.duration:>=1000", default_project)
         # The threshold stored in the database will not be considered and rather the one from the parameter will be
         # preferred.
         create_project_threshold(default_project, 200, TransactionMetric.DURATION.value)
@@ -406,15 +407,15 @@ def test_get_metric_extraction_config_with_apdex(default_project):
             "mri": "c:transactions/on_demand@none",
             "tags": [
                 {
-                    "condition": {"name": "event.duration", "op": "lte", "value": 10},
+                    "condition": {"name": "event.duration", "op": "lte", "value": threshold},
                     "key": "satisfaction",
                     "value": "satisfactory",
                 },
                 {
                     "condition": {
                         "inner": [
-                            {"name": "event.duration", "op": "gt", "value": 10},
-                            {"name": "event.duration", "op": "lte", "value": 40},
+                            {"name": "event.duration", "op": "gt", "value": threshold},
+                            {"name": "event.duration", "op": "lte", "value": threshold * 4},
                         ],
                         "op": "and",
                     },
@@ -422,7 +423,7 @@ def test_get_metric_extraction_config_with_apdex(default_project):
                     "value": "tolerable",
                 },
                 {
-                    "condition": {"name": "event.duration", "op": "gt", "value": 40},
+                    "condition": {"name": "event.duration", "op": "gt", "value": threshold * 4},
                     "key": "satisfaction",
                     "value": "frustrated",
                 },
@@ -447,6 +448,43 @@ def test_get_metric_extraction_config_with_no_tag_spec(default_project, metric):
             "field": None,
             "mri": "c:transactions/on_demand@none",
             "tags": [{"key": "query_hash", "value": ANY}],
+        }
+
+
+def test_get_metric_extraction_config_user_misery(default_project, metric):
+    with Feature({ON_DEMAND_METRICS: True, ON_DEMAND_METRICS_WIDGETS: True}):
+        transaction_duration = 100
+        threshold = 10
+        create_widget(
+            [f"user_misery({threshold})"],
+            f"transaction.duration:>={transaction_duration}",
+            default_project,
+        )
+        # The threshold stored in the database will not be considered and rather the one from the parameter will be
+        # preferred.
+        create_project_threshold(default_project, 200, TransactionMetric.DURATION.value)
+        config = get_metric_extraction_config(default_project)
+
+        assert config
+        assert len(config["metrics"]) == 1
+        assert config["metrics"][0] == {
+            "category": "transaction",
+            "condition": {
+                "name": "event.duration",
+                "op": "gte",
+                "value": float(transaction_duration),
+            },
+            "field": None,
+            "mri": "c:transactions/on_demand@none",
+            # XXX: This is likely not it
+            "tags": [
+                {
+                    "condition": {"name": "event.duration", "op": "gt", "value": threshold * 4},
+                    "key": "satisfaction",
+                    "value": "frustrated",
+                },
+                {"key": "query_hash", "value": ANY},
+            ],
         }
 
 
