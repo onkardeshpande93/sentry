@@ -186,10 +186,8 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
 
   getAllSelectedProjects(): Project[] {
     const {selection, projects} = this.props;
-    return projects.filter(
-      project =>
-        selection.projects.indexOf(parseInt(project.id, 10)) > -1 ||
-        selection.projects.indexOf(-1) > -1
+    return projects.filter(project =>
+      selection.projects.some(id => id === parseInt(project.id, 10) || id === -1)
     );
   }
 
@@ -503,7 +501,7 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
         <ThresholdsList
           organization={organization}
           selectedEnvs={selection.environments}
-          selectedProjects={selection.projects}
+          selectedProjectIds={selection.projects}
         />
       );
     }
