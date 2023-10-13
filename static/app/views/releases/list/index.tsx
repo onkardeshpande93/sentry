@@ -17,7 +17,6 @@ import NoProjectMessage from 'sentry/components/noProjectMessage';
 import PageFilterBar from 'sentry/components/organizations/pageFilterBar';
 import PageFiltersContainer from 'sentry/components/organizations/pageFilters/container';
 import {getRelativeSummary} from 'sentry/components/organizations/timeRangeSelector/utils';
-import {PageHeadingQuestionTooltip} from 'sentry/components/pageHeadingQuestionTooltip';
 import Pagination from 'sentry/components/pagination';
 import Panel from 'sentry/components/panels/panel';
 import ProjectPageFilter from 'sentry/components/projectPageFilter';
@@ -28,6 +27,7 @@ import {ALL_ACCESS_PROJECTS} from 'sentry/constants/pageFilters';
 import {releaseHealth} from 'sentry/data/platformCategories';
 import {IconSearch} from 'sentry/icons';
 import {t} from 'sentry/locale';
+import ConfigStore from 'sentry/stores/configStore';
 import ProjectsStore from 'sentry/stores/projectsStore';
 import {space} from 'sentry/styles/space';
 import {
@@ -49,7 +49,9 @@ import DeprecatedAsyncView from 'sentry/views/deprecatedAsyncView';
 
 import ReleaseArchivedNotice from '../detail/overview/releaseArchivedNotice';
 import {isMobileRelease} from '../utils';
+import {THRESHOLDS_VIEW} from '../utils/constants';
 
+import Header from './header';
 import ReleaseCard from './releaseCard';
 import ReleasesAdoptionChart from './releasesAdoptionChart';
 import ReleasesDisplayOptions, {ReleasesDisplayOption} from './releasesDisplayOptions';
@@ -57,6 +59,7 @@ import ReleasesPromo from './releasesPromo';
 import ReleasesRequest from './releasesRequest';
 import ReleasesSortOptions, {ReleasesSortOption} from './releasesSortOptions';
 import ReleasesStatusOptions, {ReleasesStatusOption} from './releasesStatusOptions';
+import ThresholdsList from './thresholdsList';
 
 type RouteParams = {
   orgId: string;
@@ -75,6 +78,7 @@ type State = {
 class ReleasesList extends DeprecatedAsyncView<Props, State> {
   shouldReload = true;
   shouldRenderBadRequests = true;
+  hasV2ReleaseUIEnabled = this.props.organization.features.includes('release-ui-v2');
 
   getTitle() {
     return routeTitleGen(t('Releases'), this.props.organization.slug, false);
@@ -100,10 +104,10 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
 
     const endpoints: ReturnType<DeprecatedAsyncView['getEndpoints']> = [
       [
-        'releases',
-        `/organizations/${organization.slug}/releases/`,
-        {query},
-        {disableEntireQuery: true},
+        'releases', // stateKey
+        `/organizations/${organization.slug}/releases/`, // endpoint
+        {query}, // params
+        {disableEntireQuery: true}, // options
       ],
     ];
 
@@ -178,6 +182,51 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
     const selectedProjectId =
       selection.projects && selection.projects.length === 1 && selection.projects[0];
     return projects?.find(p => p.id === `${selectedProjectId}`);
+  }
+
+  getAllSelectedProjects(): Project[] {
+    const {selection, projects} = this.props;
+    return projects.filter(
+      project =>
+        selection.projects.indexOf(parseInt(project.id, 10)) > -1 ||
+        selection.projects.indexOf(-1) > -1
+    );
+  }
+
+  getAllEnvironments(): string[] {
+    const {selection, projects} = this.props;
+    const selectedProjects = selection.projects;
+    const {user} = ConfigStore.getState();
+    const allEnvSet = new Set(projects.flatMap(project => project.environments));
+    // NOTE: mostly taken from environmentSelector.tsx
+    const unSortedEnvs = new Set(
+      projects.flatMap(project => {
+        const projectId = parseInt(project.id, 10);
+        /**
+         * Include environments from:
+         * all projects if the user is a superuser
+         * the requested projects
+         * all member projects if 'my projects' (empty list) is selected.
+         * all projects if -1 is the only selected project.
+         */
+        if (
+          (selectedProjects.length === 1 &&
+            selectedProjects[0] === ALL_ACCESS_PROJECTS &&
+            project.hasAccess) ||
+          (selectedProjects.length === 0 && (project.isMember || user.isSuperuser)) ||
+          selectedProjects.includes(projectId)
+        ) {
+          return project.environments;
+        }
+
+        return [];
+      })
+    );
+    const envDiff = new Set([...allEnvSet].filter(x => !unSortedEnvs.has(x)));
+
+    return Array.from(unSortedEnvs)
+      .sort()
+      .concat([...envDiff].sort());
   }
 
   get projectHasSessions() {
@@ -449,6 +498,16 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
       return <ReleasesPromo organization={organization} project={selectedProject!} />;
     }
 
+    if (this.hasV2ReleaseUIEnabled && router.location.query.view === THRESHOLDS_VIEW) {
+      return (
+        <ThresholdsList
+          organization={organization}
+          selectedEnvs={selection.environments}
+          selectedProjects={selection.projects}
+        />
+      );
+    }
+
     return (
       <ReleasesRequest
         releases={releases.map(({version}) => version)}
@@ -502,7 +561,7 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
   }
 
   renderBody() {
-    const {organization, selection} = this.props;
+    const {organization, selection, router} = this.props;
     const {releases, reloading, error} = this.state;
 
     const activeSort = this.getSort();
@@ -516,23 +575,16 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
     const showReleaseAdoptionStages =
       hasAnyMobileProject && selection.environments.length === 1;
     const hasReleasesSetup = releases && releases.length > 0;
+    const viewingThresholds = router.location.query.view === THRESHOLDS_VIEW;
 
     return (
       <PageFiltersContainer showAbsolute={false}>
         <NoProjectMessage organization={organization}>
-          <Layout.Header>
-            <Layout.HeaderContent>
-              <Layout.Title>
-                {t('Releases')}
-                <PageHeadingQuestionTooltip
-                  docsUrl="https://docs.sentry.io/product/releases/"
-                  title={t(
-                    'A visualization of your release adoption from the past 24 hours, providing a high-level view of the adoption stage, percentage of crash-free users and sessions, and more.'
-                  )}
-                />
-              </Layout.Title>
-            </Layout.HeaderContent>
-          </Layout.Header>
+          <Header
+            organization={organization}
+            router={router}
+            hasV2ReleaseUIEnabled={this.hasV2ReleaseUIEnabled}
+          />
 
           <Layout.Body>
             <Layout.Main fullWidth>
@@ -543,13 +595,15 @@ class ReleasesList extends DeprecatedAsyncView<Props, State> {
                   <ProjectPageFilter />
                 </GuideAnchor>
                 <EnvironmentPageFilter />
-                <DatePageFilter
-                  alignDropdown="left"
-                  disallowArbitraryRelativeRanges
-                  menuFooterMessage={t(
-                    'Changing this date range will recalculate the release metrics.'
-                  )}
-                />
+                {!viewingThresholds && (
+                  <DatePageFilter
+                    alignDropdown="left"
+                    disallowArbitraryRelativeRanges
+                    hint={t(
+                      'Changing this date range will recalculate the release metrics.'
+                    )}
+                  />
+                )}
               </ReleasesPageFilterBar>
 
               {this.shouldShowQuickstart ? null : (
