@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import BinaryIO, Iterator, Optional, Tuple, Type
+from typing import BinaryIO, Iterator, Optional, Set,Tuple, Type
 
 import click
 from django.conf import settings
@@ -150,12 +150,21 @@ def _import(
         if last_seen_model_name is not None and batch:
             yield (last_seen_model_name, json.dumps(batch))
 
+    def generate_organization_slug_reservations(org_ids: Set[(int, str)]):
+        from sentry.services.organization import organization_provisioning_service
+
+        for org_id, org_slug in org_ids:
+            organization_provisioning_service.change_organization_slug(
+                slug=org_slug, organization_id=org_id
+            )
+
     # Extract some write logic into its own internal function, so that we may call it irrespective
     # of how we do atomicity: on a per-model (if using multiple dbs) or global (if using a single
     # db) basis.
     def do_write():
         allowed_relocation_scopes = scope.value
         pk_map = PrimaryKeyMap()
+        organization_objects_imported: Set[(int, str)] = set()
         for (batch_model_name, batch) in yield_json_models(src):
             model = get_model(batch_model_name)
             if model is None:
@@ -196,6 +205,8 @@ def _import(
                                 slug = getattr(o, "slug", None)
                                 pk_map.insert(model_name, old_pk, new_pk, import_kind, slug)
                                 count += 1
+                                if model_name == get_model_name(Organization):
+                                    organization_objects_imported.add((new_pk, slug))
 
                 # If we wrote at least one model, make sure to update the sequences too.
                 if count > 0:
@@ -203,6 +214,8 @@ def _import(
                     seq = f"{table}_id_seq"
                     with connections[using].cursor() as cursor:
                         cursor.execute(f"SELECT setval(%s, (SELECT MAX(id) FROM {table}))", [seq])
+
+        generate_organization_slug_reservations(organization_objects_imported)
 
     try:
         if len(settings.DATABASES) == 1:
