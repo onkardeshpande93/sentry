@@ -33,6 +33,10 @@ _INDEXER_CACHE_RESOLVE_CACHE_REPLENISHMENT_METRIC = (
 _INDEXER_CACHE_FETCH_METRIC = "sentry_metrics.indexer.memcache.fetch"
 
 
+BULK_RECORD_CACHE_NAME_SPACE = "br"
+RESOLVE_CACHE_NAMESPACE = "res"
+
+
 class StringIndexerCache:
     def __init__(self, cache_name: str, partition_key: str):
         self.version = 1
@@ -47,15 +51,18 @@ class StringIndexerCache:
         jitter = random.uniform(0, 0.25) * cache_ttl
         return int(cache_ttl + jitter)
 
-    def make_cache_key(self, key: str) -> str:
+    def make_cache_key(self, namespace: str, key: str) -> str:
         use_case_id, org_id, string = key.split(":", 2)
-        org_string = org_id + ":" + string
+        org_string = f"{org_id}:{string}"
         hashed = md5_text(org_string).hexdigest()
+
+        if options.get("sentry-metrics.indexer.read-new-cache-namespace"):
+            return f"indexer:{self.partition_key}:{namespace}:org:str:{use_case_id}:{hashed}"
 
         return f"indexer:{self.partition_key}:org:str:{use_case_id}:{hashed}"
 
     def _format_results(
-        self, keys: Iterable[str], results: Mapping[str, Optional[int]]
+        self, namespace: str, keys: Iterable[str], results: Mapping[str, Optional[int]]
     ) -> MutableMapping[str, Optional[int]]:
         """
         Takes in keys formatted like "use_case_id:org_id:string", and results that have the
@@ -67,40 +74,51 @@ class StringIndexerCache:
         """
         formatted: MutableMapping[str, Optional[int]] = {}
         for key in keys:
-            cache_key = self.make_cache_key(key)
+            cache_key = self.make_cache_key(namespace, key)
             formatted[key] = results.get(cache_key)
 
         return formatted
 
-    def get(self, key: str) -> int:
-        result: int = self.cache.get(self.make_cache_key(key), version=self.version)
+    def get(self, namespace: str, key: str) -> int:
+        result = self.cache.get(self.make_cache_key(namespace, key), version=self.version)
+        if options.get("sentry-metrics.indexer.read-new-cache-namespace"):
+            return int(result.split(":")[0])
         return result
 
-    def set(self, key: str, value: int) -> None:
+    def set(self, namespace: str, key: str, value: int) -> None:
         self.cache.set(
-            key=self.make_cache_key(key),
+            key=self.make_cache_key(namespace, key),
             value=value,
             timeout=self.randomized_ttl,
             version=self.version,
         )
 
-    def get_many(self, keys: Iterable[str]) -> MutableMapping[str, Optional[int]]:
-        cache_keys = {self.make_cache_key(key): key for key in keys}
-        results: Mapping[str, Optional[int]] = self.cache.get_many(
-            cache_keys.keys(), version=self.version
-        )
-        return self._format_results(keys, results)
+    def get_many(self, namespace: str, keys: Iterable[str]) -> MutableMapping[str, Optional[int]]:
+        cache_keys = {self.make_cache_key(namespace, key): key for key in keys}
 
-    def set_many(self, key_values: Mapping[str, int]) -> None:
-        cache_key_values = {self.make_cache_key(k): v for k, v in key_values.items()}
+        if options.get("sentry-metrics.indexer.read-new-cache-namespace"):
+            results: Mapping[str, Optional[int]] = {
+                k: int(v.split(":")[0])
+                for k, v in self.cache.get_many(cache_keys.keys(), version=self.version)
+            }
+        else:
+            results = self.cache.get_many(cache_keys.keys(), version=self.version)
+        return self._format_results(
+            namespace,
+            keys,
+            results,
+        )
+
+    def set_many(self, namespace: str, key_values: Mapping[str, int]) -> None:
+        cache_key_values = {self.make_cache_key(namespace, k): v for k, v in key_values.items()}
         self.cache.set_many(cache_key_values, timeout=self.randomized_ttl, version=self.version)
 
-    def delete(self, key: str) -> None:
-        cache_key = self.make_cache_key(key)
+    def delete(self, namespace: str, key: str) -> None:
+        cache_key = self.make_cache_key(namespace, key)
         self.cache.delete(cache_key, version=self.version)
 
-    def delete_many(self, keys: Sequence[str]) -> None:
-        cache_keys = [self.make_cache_key(key) for key in keys]
+    def delete_many(self, namespace: str, keys: Sequence[str]) -> None:
+        cache_keys = [self.make_cache_key(namespace, key) for key in keys]
         self.cache.delete_many(cache_keys, version=self.version)
 
 
@@ -112,10 +130,11 @@ class CachingIndexer(StringIndexer):
     def bulk_record(
         self, strings: Mapping[UseCaseID, Mapping[OrgId, Set[str]]]
     ) -> UseCaseKeyResults:
+
         cache_keys = UseCaseKeyCollection(strings)
         metrics.gauge("sentry_metrics.indexer.lookups_per_batch", value=cache_keys.size)
         cache_key_strs = cache_keys.as_strings()
-        cache_results = self.cache.get_many(cache_key_strs)
+        cache_results = self.cache.get_many(BULK_RECORD_CACHE_NAME_SPACE, cache_key_strs)
 
         hits = [k for k, v in cache_results.items() if v is not None]
 
@@ -155,7 +174,9 @@ class CachingIndexer(StringIndexer):
             }
         )
 
-        self.cache.set_many(db_record_key_results.get_mapped_strings_to_ints())
+        self.cache.set_many(
+            BULK_RECORD_CACHE_NAME_SPACE, db_record_key_results.get_mapped_strings_to_ints()
+        )
 
         return cache_key_results.merge(db_record_key_results)
 
@@ -166,7 +187,7 @@ class CachingIndexer(StringIndexer):
     @metric_path_key_compatible_resolve
     def resolve(self, use_case_id: UseCaseID, org_id: int, string: str) -> Optional[int]:
         key = f"{use_case_id.value}:{org_id}:{string}"
-        result = self.cache.get(key)
+        result = self.cache.get(RESOLVE_CACHE_NAMESPACE, key)
 
         if result and isinstance(result, int):
             metrics.incr(
@@ -188,7 +209,7 @@ class CachingIndexer(StringIndexer):
                     _INDEXER_CACHE_RESOLVE_CACHE_REPLENISHMENT_METRIC,
                     tags={"use_case": use_case_id.value},
                 )
-                self.cache.set(key, id)
+                self.cache.set(RESOLVE_CACHE_NAMESPACE, key, id)
 
         return id
 
