@@ -6,10 +6,13 @@ from celery.exceptions import MaxRetriesExceededError
 from django.utils import timezone
 from sentry_sdk import set_tag
 
-from sentry import analytics
+from sentry import analytics, features
 from sentry.api.serializers.models.release import get_users_for_authors
 from sentry.integrations.base import IntegrationInstallation
-from sentry.integrations.utils.commit_context import find_commit_context_for_event
+from sentry.integrations.utils.commit_context import (
+    find_commit_context_for_event,
+    find_commit_context_for_event_all_frames,
+)
 from sentry.locks import locks
 from sentry.models.commit import Commit
 from sentry.models.commitauthor import CommitAuthor
@@ -237,6 +240,15 @@ def process_commit_context(
                     sdk_name=sdk_name,
                 )
                 return
+
+            if features.has("organizations:suspect-commits-all-frames", project.organization):
+                find_commit_context_for_event_all_frames(
+                    code_mappings=code_mappings,
+                    frames=frames,
+                    organization_id=project.organization_id,
+                    project_id=project_id,
+                    extra={},
+                )
 
             found_contexts, installation = find_commit_context_for_event(
                 code_mappings=code_mappings,
