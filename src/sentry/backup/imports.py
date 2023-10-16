@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import BinaryIO, Iterator, Optional, Set,Tuple, Type
+from typing import BinaryIO, Iterator, Optional, Set, Tuple, Type
 
 import click
 from django.conf import settings
@@ -150,14 +150,6 @@ def _import(
         if last_seen_model_name is not None and batch:
             yield (last_seen_model_name, json.dumps(batch))
 
-    def generate_organization_slug_reservations(org_ids: Set[Tuple[int, str]]):
-        from sentry.services.organization import organization_provisioning_service
-
-        for org_id, org_slug in org_ids:
-            organization_provisioning_service.change_organization_slug(
-                slug=org_slug, organization_id=org_id
-            )
-
     # Extract some write logic into its own internal function, so that we may call it irrespective
     # of how we do atomicity: on a per-model (if using multiple dbs) or global (if using a single
     # db) basis.
@@ -215,7 +207,15 @@ def _import(
                     with connections[using].cursor() as cursor:
                         cursor.execute(f"SELECT setval(%s, (SELECT MAX(id) FROM {table}))", [seq])
 
-        generate_organization_slug_reservations(organization_objects_imported)
+            # If we've just imported organization models, generate organization slug
+            # reservations and organization mappings for each one.
+            if len(organization_objects_imported) > 0:
+                from sentry.services.organization import organization_provisioning_service
+
+                organization_provisioning_service.bulk_create_organization_slugs(
+                    org_ids_and_slugs=organization_objects_imported
+                )
+                organization_objects_imported.clear()
 
     try:
         if len(settings.DATABASES) == 1:
