@@ -1,6 +1,6 @@
 import {Fragment, ReactNode} from 'react';
 import queryString from 'query-string';
-
+import styled from '@emotion/styled';
 import FeatureBadge from 'sentry/components/featureBadge';
 import ExternalLink from 'sentry/components/links/externalLink';
 import ListLink from 'sentry/components/links/listLink';
@@ -28,7 +28,7 @@ function getReplayTabs(organization: Organization): Record<TabKey, ReactNode> {
     [TabKey.TRACE]: hasTraceTable ? null : t('Trace'),
     [TabKey.PERF]: null,
     [TabKey.A11Y]: hasA11yTab ? (
-      <Fragment>
+      <FlexCenter>
         <Tooltip
           isHoverable
           title={
@@ -48,7 +48,7 @@ function getReplayTabs(organization: Organization): Record<TabKey, ReactNode> {
           type="alpha"
           title={t('This feature is available for early adopters and may change')}
         />
-      </Fragment>
+      </FlexCenter>
     ) : null,
     [TabKey.MEMORY]: t('Memory'),
     [TabKey.TAGS]: t('Tags'),
@@ -93,3 +93,8 @@ function FocusTabs({className}: Props) {
 }
 
 export default FocusTabs;
+
+const FlexCenter = styled('div')`
+  display: flex;
+  align-items: center;
+`;
